@@ -131,7 +131,6 @@ namespace ycsbc {
   };
   // Struct for handling responses for each requester
   struct ResponseData {
-      std::string resultData;
       ResultStatus status;
 
       ResponseData() : status(ResultStatus::ERROR) {}
@@ -251,20 +250,6 @@ void RocksdbDB::Init() {
   }
   if (--ref_cnt_) {
     return;
-  }
-  delete db_;
-}
-
-void RocksdbDB::Cleanup() { 
-  const std::lock_guard<std::mutex> lock(mu_);
-  if (--ref_cnt_) {
-    return;
-  }
-  for (size_t i = 0; i < cf_handles_.size(); i++) {
-    if (cf_handles_[i] != nullptr) {
-      delete cf_handles_[i];
-      cf_handles_[i] = nullptr;
-    }
   }
   delete db_;
 }
@@ -464,11 +449,6 @@ void RocksdbDB::DeserializeRow(std::vector<Field> &values, const std::string &da
   DeserializeRow(values, p, lim);
 }
 
-void copyResultData(ResponseData* responseData, const std::string& resultData) {
-    // Copy the result data into the responseData object
-    responseData->resultData = resultData;
-}
-
 ResponseData* SubmitTaskAndWaitForResponse(
     const std::string& requesterId,
     const json& task) {
@@ -490,52 +470,42 @@ ResponseData* SubmitTaskAndWaitForResponse(
         // Send the task string to the server
         boost::asio::write(socket, boost::asio::buffer(taskString));
 
-        //std::cout << "Task sent to server: " << taskString << std::endl;
-
-        // Buffer to store the response from the server
+        // Buffer to store the immediate response from the server
         boost::asio::streambuf responseBuffer;
         boost::system::error_code error;
 
         // Wait and read the response from the server
         boost::asio::read_until(socket, responseBuffer, "\n", error);
 
-        /* auto now = std::chrono::high_resolution_clock::now();
-        auto now_ns = std::chrono::time_point_cast<std::chrono::nanoseconds>(now);
-        auto duration = now_ns.time_since_epoch();  // Duration since epoch in nanoseconds
-        std::cout << "Response received at time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() << std::endl;
-        */
         if (error && error != boost::asio::error::eof) {
             throw boost::system::system_error(error);  // Handle read error
         }
 
-        // Convert the buffer to a string (response from server)
+        // Convert the buffer to a string (acknowledgment response from server)
         std::istream responseStream(&responseBuffer);
         std::string responseDataString;
         std::getline(responseStream, responseDataString);
 
-        //std::cout << "Response received: " << responseDataString << std::endl;
-
-        // Parse the response as JSON
+        // Parse the acknowledgment response as JSON
         json responseJson = json::parse(responseDataString);
 
-        // Create a ResponseData object to hold the result
+        // Create a ResponseData object to hold the acknowledgment result
         ResponseData* responseData = new ResponseData();
 
-        // Extract result data and status from the response JSON
-        std::string resultData = responseJson["resultData"];
+        // Check the status in the response JSON
         std::string statusString = responseJson["status"];
 
-        // Copy the result data into the responseData object
-        copyResultData(responseData, resultData);
-
-        // Convert status string to ResultStatus enum
-        if (statusString == "OK") {
+        // Set the status based on acknowledgment response
+        if (statusString == "ACCEPTED") {
             responseData->status = ResultStatus::OK;
+        } else if (statusString == "REJECTED") {
+            responseData->status = ResultStatus::ERROR;
         } else {
+            // Handle unexpected status
             responseData->status = ResultStatus::ERROR;
         }
 
-        // Return the response object
+        // Return the response object with the acknowledgment status
         return responseData;
 
     } catch (std::exception& e) {
@@ -544,7 +514,36 @@ ResponseData* SubmitTaskAndWaitForResponse(
     }
 }
 
+void RocksdbDB::Cleanup() { 
+  std::string requesterId = getCurrentThreadIdAsString(); // Get the current thread ID as the requester ID
 
+  json endTask;
+  endTask["requesterId"] = requesterId;
+  endTask["operation"] = "end";
+  endTask["database"] = db_path;  // Use the correct database path
+
+  // Submit the "end" task to the thread pool
+  ResponseData* endResponse = SubmitTaskAndWaitForResponse(requesterId, endTask);
+
+  // Check the response for success
+  if (endResponse->status != ResultStatus::OK) {
+    std::cerr << "Warning: Failed to close database in Cleanup()." << std::endl;
+  }
+
+  delete endResponse;  // Clean up the response object
+
+  const std::lock_guard<std::mutex> lock(mu_);
+  if (--ref_cnt_) {
+    return;
+  }
+  for (size_t i = 0; i < cf_handles_.size(); i++) {
+    if (cf_handles_[i] != nullptr) {
+      delete cf_handles_[i];
+      cf_handles_[i] = nullptr;
+    }
+  }
+  delete db_;  // Delete the database object
+}
 
 
 // Example function modified for proper boost::interprocess usage
@@ -560,26 +559,20 @@ DB::Status RocksdbDB::ReadSingle(const std::string &table, const std::string &ke
     task["key"] = key;
     task["database"] = db_path;  // Ensure db_path is initialized properly
 
+    // Submit the task and receive only an acceptance/rejection response
     ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
-    // Check result status
+    // Check acknowledgment status from the server response
     if (response->status == ResultStatus::ERROR) {
-        return kError;  // Handle the error case
+        delete response;  // Clean up the allocated response data
+        return kError;    // Return error status if the request was rejected
     }
 
-    // Deserialize the result data (no need for strlen anymore)
-    std::string data = response->resultData;
-
-    // Process result based on whether fields are provided
-    if (fields != nullptr) {
-        DeserializeRowFilter(result, data, *fields);  // Deserialize with field filter
-    } else {
-        DeserializeRow(result, data);  // Deserialize entire row
-        assert(result.size() == static_cast<size_t>(fieldcount_));
-    }
-
-    return kOK;
+    // If the request was accepted, assume it will be processed, but no result is received
+    delete response;  // Clean up the allocated response data
+    return kOK;       // Return OK status since the request was accepted
 }
+
 
 DB::Status RocksdbDB::ScanSingle(const std::string &table, const std::string &key, int len,
                                  const std::vector<std::string> *fields,
@@ -598,28 +591,15 @@ DB::Status RocksdbDB::ScanSingle(const std::string &table, const std::string &ke
     // Use the generalized function to submit the task and wait for the response
     ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
-    // Parse the response
-    if (response->status == ResultStatus::OK) {
-        // Use the string from response->resultData directly (no need for manual sizing)
-        std::istringstream stream(response->resultData);  // String stream for parsing lines
-
-        std::string line;
-        int count = 0;
-        while (std::getline(stream, line) && count < len) {
-            result.push_back(std::vector<Field>());
-            std::vector<Field> &values = result.back();
-            if (fields != nullptr) {
-                DeserializeRowFilter(values, line, *fields);
-            } else {
-                DeserializeRow(values, line);
-                assert(values.size() == static_cast<size_t>(fieldcount_));
-            }
-            count++;
-        }
-        return kOK;
-    } else {
-        return kNotFound;  // Handle error or not found case
+    // Check acknowledgment status from the server response
+    if (response->status == ResultStatus::ERROR) {
+        delete response;  // Clean up the allocated response data
+        return kError;    // Return error status if the request was rejected
     }
+
+    // If the request was accepted, assume it will be processed, but no result is received
+    delete response;  // Clean up the allocated response data
+    return kOK;       // Return OK status since the request was accepted
 }
 
 DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &key,
@@ -627,7 +607,7 @@ DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &
     // Convert thread ID to string for requesterId
     std::string requesterId = getCurrentThreadIdAsString();
 
-    // --------- Step 1: Read the existing data using thread pool ---------
+    // --------- Step 1: Attempt to Read the Existing Data ---------
     // Prepare the read task as a JSON object
     json readTask;
     readTask["requesterId"] = requesterId;
@@ -635,40 +615,20 @@ DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &
     readTask["database"] = db_path;  // Ensure db_path is properly initialized
     readTask["key"] = key;
 
-    // Submit the read task and wait for the response
+    // Submit the read task and receive only an acknowledgment response
     ResponseData* readResponse = SubmitTaskAndWaitForResponse(requesterId, readTask);
 
-    // Check if the read was successful and process the response
-    std::string existingData;
-    if (readResponse->status == ResultStatus::OK) {
-        existingData = readResponse->resultData;  // Directly get the result data string
-    } else if (readResponse->status == ResultStatus::ERROR) {
-        return kNotFound;  // Return not found if read operation fails
-    } else {
-        throw utils::Exception("RocksDB Read: Error occurred during read");
+    // Check if the read request was accepted
+    if (readResponse->status == ResultStatus::ERROR) {
+        delete readResponse;  // Clean up the allocated response data
+        return kError;     // Return not found if read request was rejected
     }
+    delete readResponse;  // Clean up the allocated response data
 
-    // --------- Step 2: Update the data ---------
-    std::vector<Field> currentValues;
-    DeserializeRow(currentValues, existingData);  // Deserialize the row into fields
-    assert(currentValues.size() == static_cast<size_t>(fieldcount_));  // Ensure row size matches field count
-
-    for (Field &newField : values) {
-        bool found = false;
-        for (Field &curField : currentValues) {
-            if (curField.name == newField.name) {
-                found = true;
-                curField.value = newField.value;  // Update the field's value
-                break;
-            }
-        }
-        assert(found);  // Ensure the field to update was found
-    }
-
-    // --------- Step 3: Insert the updated data using thread pool ---------
-    // Serialize the updated values
+    // --------- Step 2: Prepare and Submit the Insert (Update) Task ---------
+    // Serialize the values to create the updated data string (assume `SerializeRow` creates the new data)
     std::string updatedData;
-    SerializeRow(currentValues, updatedData);  // Serialize updated row into string
+    SerializeRow(values, updatedData);  // Serialize updated values into a string
 
     // Prepare the insert task as a JSON object
     json insertTask;
@@ -678,15 +638,17 @@ DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &
     insertTask["key"] = key;
     insertTask["value"] = updatedData;
 
-    // Submit the insert task and wait for the response
+    // Submit the insert task and receive only an acknowledgment response
     ResponseData* insertResponse = SubmitTaskAndWaitForResponse(requesterId, insertTask);
 
-    // Check the insert response status
-    if (insertResponse->status == ResultStatus::OK) {
-        return kOK;  // Successfully updated and inserted
-    } else {
-        throw utils::Exception("RocksDB Insert: Error occurred during insert");
+    // Check if the insert request was accepted
+    if (insertResponse->status == ResultStatus::ERROR) {
+        delete insertResponse;  // Clean up the allocated response data
+        return kError;
     }
+    
+    delete insertResponse;  // Clean up the allocated response data
+    return kOK;  // Successfully submitted the update
 }
 
 
@@ -710,12 +672,15 @@ DB::Status RocksdbDB::MergeSingle(const std::string &table, const std::string &k
     // Submit the merge task and wait for the response
     ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
-    // Check the merge response status
-    if (response->status == ResultStatus::OK) {
-        return kOK;  // Return success if the merge was successful
-    } else {
-        return kError;  // Return an error in case the merge failed
+    // Check acknowledgment status from the server response
+    if (response->status == ResultStatus::ERROR) {
+        delete response;  // Clean up the allocated response data
+        return kError;    // Return error status if the request was rejected
     }
+
+    // If the request was accepted, assume it will be processed, but no result is received
+    delete response;  // Clean up the allocated response data
+    return kOK;       // Return OK status since the request was accepted
 }
 
 DB::Status RocksdbDB::InsertSingle(const std::string &table, const std::string &key,
@@ -738,12 +703,15 @@ DB::Status RocksdbDB::InsertSingle(const std::string &table, const std::string &
     // Submit the insert task and wait for the response
     ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
-    // Check the insert response status
-    if (response->status == ResultStatus::OK) {
-        return kOK;  // Return success if the insertion was successful
-    } else {
-        throw utils::Exception("RocksDB Insert: Error occurred during insertion");
+    // Check acknowledgment status from the server response
+    if (response->status == ResultStatus::ERROR) {
+        delete response;  // Clean up the allocated response data
+        return kError;    // Return error status if the request was rejected
     }
+
+    // If the request was accepted, assume it will be processed, but no result is received
+    delete response;  // Clean up the allocated response data
+    return kOK;       // Return OK status since the request was accepted
 }
 
 DB::Status RocksdbDB::DeleteSingle(const std::string &table, const std::string &key) {
@@ -760,12 +728,15 @@ DB::Status RocksdbDB::DeleteSingle(const std::string &table, const std::string &
     // Submit the delete task and wait for the response
     ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
-    // Check the delete response status
-    if (response->status == ResultStatus::OK) {
-        return kOK;  // Return success if deletion was successful
-    } else {
-        throw utils::Exception("RocksDB Delete: Error occurred during deletion");
+    // Check acknowledgment status from the server response
+    if (response->status == ResultStatus::ERROR) {
+        delete response;  // Clean up the allocated response data
+        return kError;    // Return error status if the request was rejected
     }
+
+    // If the request was accepted, assume it will be processed, but no result is received
+    delete response;  // Clean up the allocated response data
+    return kOK;       // Return OK status since the request was accepted
 }
 
 DB *NewRocksdbDB() {
