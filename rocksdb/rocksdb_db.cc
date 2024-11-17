@@ -21,14 +21,19 @@
 #include <rocksdb/utilities/options_util.h>
 #include <rocksdb/write_batch.h>
 
-#include <boost/asio.hpp>
+#include <boost/interprocess/managed_shared_memory.hpp>
+#include <boost/interprocess/sync/named_mutex.hpp>
+#include <boost/interprocess/sync/named_condition.hpp>
+#include <boost/interprocess/containers/deque.hpp>
+#include <boost/interprocess/containers/string.hpp>
+#include <boost/interprocess/allocators/allocator.hpp>
+#include <boost/interprocess/segment_manager.hpp>
+
 #include <vector>
 #include "json.hpp"  // For handling JSON
 
-using boost::asio::ip::tcp;
 using json = nlohmann::json;
-
-using json = nlohmann::json;
+namespace bip = boost::interprocess;
 
 namespace {
   const std::string PROP_NAME = "rocksdb.dbname";
@@ -143,14 +148,26 @@ std::string getCurrentThreadIdAsString() {
     return ss.str();  // Convert the stringstream into a string
 }
 
+typedef bip::allocator<char, bip::managed_shared_memory::segment_manager>
+   CharAllocator;
+typedef bip::basic_string<char, std::char_traits<char>, CharAllocator>
+   ShmString;
+typedef bip::allocator<ShmString, bip::managed_shared_memory::segment_manager>
+   StringAllocator;
+typedef bip::deque<ShmString, StringAllocator>
+   ShmStringList;
+
 std::vector<rocksdb::ColumnFamilyHandle *> RocksdbDB::cf_handles_;
 rocksdb::DB *RocksdbDB::db_ = nullptr;
 int RocksdbDB::ref_cnt_ = 0;
 std::mutex RocksdbDB::mu_;
 std::string db_path;
 
+
+
+
 void RocksdbDB::Init() {
-// merge operator disabled by default due to link error
+    
 
 #ifdef USE_MERGEUPDATE
   class YCSBUpdateMerge : public rocksdb::AssociativeMergeOperator {
@@ -449,69 +466,50 @@ void RocksdbDB::DeserializeRow(std::vector<Field> &values, const std::string &da
   DeserializeRow(values, p, lim);
 }
 
-ResponseData* SubmitTaskAndWaitForResponse(
-    const std::string& requesterId,
-    const json& task) {
-    const std::string& server_ip = "127.0.0.1";
-    const std::string& server_port = "12345";
-    try {
-        // Create I/O context and resolver
-        boost::asio::io_context io_context;
-        tcp::resolver resolver(io_context);
-        tcp::resolver::results_type endpoints = resolver.resolve(server_ip, server_port);
+ResponseData* SubmitTaskAndWaitForResponse(const std::string& requesterId, const json& task) {
+  try {
+    // merge operator disabled by default due to link error
+    bip::managed_shared_memory segment(bip::open_only, "SharedMemory");
+    // Print total memory, free memory, and fragmentation
 
-        // Create and connect the socket
-        tcp::socket socket(io_context);
-        boost::asio::connect(socket, endpoints);
+    CharAllocator *charallocator = new CharAllocator(segment.get_segment_manager());
 
-        // Convert task to a string (JSON format)
-        std::string taskString = task.dump() + "\n";
+    // Find the shared queue in shared memory
+    ShmStringList *queue = segment.find<ShmStringList>("Queue").first;
 
-        // Send the task string to the server
-        boost::asio::write(socket, boost::asio::buffer(taskString));
+    bip::named_mutex *mutex = new bip::named_mutex(bip::open_only, "SharedMutex");
+    bip::named_condition *condition = new bip::named_condition(bip::open_only, "SharedCondition");
 
-        // Buffer to store the immediate response from the server
-        boost::asio::streambuf responseBuffer;
-        boost::system::error_code error;
+      // Convert the task to a JSON string
+      ShmString taskString(*charallocator);
+      taskString = task.dump();
 
-        // Wait and read the response from the server
-        boost::asio::read_until(socket, responseBuffer, "\n", error);
-
-        if (error && error != boost::asio::error::eof) {
-            throw boost::system::system_error(error);  // Handle read error
-        }
-
-        // Convert the buffer to a string (acknowledgment response from server)
-        std::istream responseStream(&responseBuffer);
-        std::string responseDataString;
-        std::getline(responseStream, responseDataString);
-
-        // Parse the acknowledgment response as JSON
-        json responseJson = json::parse(responseDataString);
-
-        // Create a ResponseData object to hold the acknowledgment result
-        ResponseData* responseData = new ResponseData();
-
-        // Check the status in the response JSON
-        std::string statusString = responseJson["status"];
-
-        // Set the status based on acknowledgment response
-        if (statusString == "ACCEPTED") {
-            responseData->status = ResultStatus::OK;
-        } else if (statusString == "REJECTED") {
-            responseData->status = ResultStatus::ERROR;
-        } else {
-            // Handle unexpected status
-            responseData->status = ResultStatus::ERROR;
-        }
-
-        // Return the response object with the acknowledgment status
-        return responseData;
-
-    } catch (std::exception& e) {
-        std::cerr << "Exception: " << e.what() << "\n";
-        return nullptr;
-    }
+      // Lock the shared memory queue
+      {   
+          bip::scoped_lock<bip::named_mutex> lock(*mutex);
+          // Check if the queue length is less than 1000
+          if (queue->size() < 1000000) {
+              // Add the task to the queue
+              queue->push_back(taskString);
+              // Notify the server that a new task is available
+              (*condition).notify_one();
+              // Create and return a response object with ACCEPTED status
+              ResponseData* responseData = new ResponseData();
+              responseData->status = ResultStatus::OK;
+              return responseData;
+          } else {
+              // Return a response object with REJECTED status
+              ResponseData* responseData = new ResponseData();
+              responseData->status = ResultStatus::ERROR;
+              return responseData;
+          }
+      }
+  } catch (const std::exception& e) {
+      std::cerr << "Exception: " << e.what() << "\n";
+      ResponseData* responseData = new ResponseData();
+      responseData->status = ResultStatus::ERROR;
+      return responseData;
+  }
 }
 
 void RocksdbDB::Cleanup() { 
@@ -521,6 +519,7 @@ void RocksdbDB::Cleanup() {
   endTask["requesterId"] = requesterId;
   endTask["operation"] = "end";
   endTask["database"] = db_path;  // Use the correct database path
+  
 
   // Submit the "end" task to the thread pool
   ResponseData* endResponse = SubmitTaskAndWaitForResponse(requesterId, endTask);
