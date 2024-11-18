@@ -470,47 +470,19 @@ ResponseData* SubmitTaskAndWaitForResponse(
         // Send the task string to the server
         boost::asio::write(socket, boost::asio::buffer(taskString));
 
-        // Buffer to store the immediate response from the server
-        boost::asio::streambuf responseBuffer;
-        boost::system::error_code error;
-
-        // Wait and read the response from the server
-        boost::asio::read_until(socket, responseBuffer, "\n", error);
-
-        if (error && error != boost::asio::error::eof) {
-            throw boost::system::system_error(error);  // Handle read error
-        }
-
-        // Convert the buffer to a string (acknowledgment response from server)
-        std::istream responseStream(&responseBuffer);
-        std::string responseDataString;
-        std::getline(responseStream, responseDataString);
-
-        // Parse the acknowledgment response as JSON
-        json responseJson = json::parse(responseDataString);
-
-        // Create a ResponseData object to hold the acknowledgment result
         ResponseData* responseData = new ResponseData();
 
-        // Check the status in the response JSON
-        std::string statusString = responseJson["status"];
-
-        // Set the status based on acknowledgment response
-        if (statusString == "ACCEPTED") {
-            responseData->status = ResultStatus::OK;
-        } else if (statusString == "REJECTED") {
-            responseData->status = ResultStatus::ERROR;
-        } else {
-            // Handle unexpected status
-            responseData->status = ResultStatus::ERROR;
-        }
+        responseData->status = ResultStatus::OK;
 
         // Return the response object with the acknowledgment status
         return responseData;
 
     } catch (std::exception& e) {
         std::cerr << "Exception: " << e.what() << "\n";
-        return nullptr;
+        ResponseData* responseData = new ResponseData();
+
+        responseData->status = ResultStatus::ERROR;
+        return responseData;
     }
 }
 
