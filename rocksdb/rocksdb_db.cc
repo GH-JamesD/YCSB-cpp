@@ -136,6 +136,35 @@ namespace ycsbc {
       ResponseData() : status(ResultStatus::ERROR) {}
   };
 
+  class SynchronizedCounter {
+    private:
+        int currentCount;
+        int maxCount;
+    
+    public:
+        // Constructor to initialize maxCount and reset currentCount to 0
+        SynchronizedCounter(int maxCount) : currentCount(0), maxCount(maxCount) {}
+    
+        // Decrement the current count in a thread-safe manner
+        void decrement() {
+            if (currentCount > 0) {
+                --currentCount;
+            }
+        }
+    
+        // Increment the current count in a thread-safe manner
+        void increment() {
+            if (currentCount < maxCount) {
+                ++currentCount;
+            }
+        }
+    
+        // Check if the current count is less than max count in a thread-safe manner
+        bool isLessThanMax() const {
+            return currentCount < maxCount;
+        }
+  };
+
 std::string getCurrentThreadIdAsString() {
     std::thread::id threadId = std::this_thread::get_id();  // Get the current thread ID
     std::stringstream ss;
@@ -148,6 +177,56 @@ rocksdb::DB *RocksdbDB::db_ = nullptr;
 int RocksdbDB::ref_cnt_ = 0;
 std::mutex RocksdbDB::mu_;
 std::string db_path;
+
+std::unique_ptr<tcp::socket> global_socket;
+std::shared_ptr<SynchronizedCounter> syncCounter = nullptr;
+bool is_initialized(false);
+std::mutex init_mutex;
+std::mutex counter_mutex;
+std::condition_variable counter_cv;
+std::condition_variable init_cv;
+
+void ReceiveThread(boost::asio::io_context& io_context, tcp::acceptor& acceptor) {
+    try {
+        while (true) {
+            tcp::socket receive_socket(io_context);
+            acceptor.accept(receive_socket);
+
+            // Read incoming data
+            boost::asio::streambuf buffer;
+            boost::asio::read_until(receive_socket, buffer, "\n");
+            std::istream is(&buffer);
+            std::string line;
+            std::getline(is, line);
+
+            // Parse JSON
+            json response = json::parse(line);
+            if (response.contains("command")) {
+                std::string command = response["command"];
+                if (command == "init") {
+                    if (response.contains("queue_size")) {
+                        int queue_size = response["queue_size"];
+                        {
+                            std::lock_guard<std::mutex> lock(init_mutex);
+                            syncCounter = std::make_shared<SynchronizedCounter>(queue_size);
+                            is_initialized = true;
+                        }
+                        init_cv.notify_all();
+                    }
+                } else if (command == "decrement") {
+                    {
+                        std::lock_guard<std::mutex> lock(counter_mutex);
+                        syncCounter->decrement(); 
+                    }
+                    counter_cv.notify_all();
+                }
+            }
+        }
+    } catch (std::exception& e) {
+        std::cerr << "ReceiveThread Exception: " << e.what() << std::endl;
+    }
+}
+
 
 void RocksdbDB::Init() {
 // merge operator disabled by default due to link error
@@ -252,6 +331,28 @@ void RocksdbDB::Init() {
     return;
   }
   delete db_;
+
+  boost::asio::io_context io_context;
+  tcp::resolver resolver(io_context);
+  auto endpoints = resolver.resolve("127.0.0.1", "12345");
+  global_socket = std::make_unique<tcp::socket>(io_context);
+  boost::asio::connect(*global_socket, endpoints);
+  // Start detached thread for receiving responses
+  boost::asio::io_context response_context;
+  tcp::acceptor acceptor(response_context, tcp::endpoint(tcp::v4(), 0));
+  int response_port = acceptor.local_endpoint().port();
+  std::thread receive_thread([&response_context, &acceptor]() {
+      ReceiveThread(response_context, acceptor);
+  });
+  receive_thread.detach();
+  // Send "start" message to the server
+  json start_message = {
+      {"operation", "start"},
+      {"database", db_path},
+      {"port", response_port}
+  };
+  std::string start_message_str = start_message.dump() + "\n";
+  boost::asio::write(*global_socket, boost::asio::buffer(start_message_str));
 }
 
 void RocksdbDB::GetOptions(const utils::Properties &props, rocksdb::Options *opt,
@@ -449,38 +550,46 @@ void RocksdbDB::DeserializeRow(std::vector<Field> &values, const std::string &da
   DeserializeRow(values, p, lim);
 }
 
-ResponseData* SubmitTaskAndWaitForResponse(
-    const std::string& requesterId,
-    const json& task) {
-    const std::string& server_ip = "127.0.0.1";
-    const std::string& server_port = "12345";
+ResponseData* SubmitTaskAndWaitForResponse(const std::string& requesterId, const json& task) {
     try {
-        // Create I/O context and resolver
-        boost::asio::io_context io_context;
-        tcp::resolver resolver(io_context);
-        tcp::resolver::results_type endpoints = resolver.resolve(server_ip, server_port);
+        // Wait for initialization
+        {
+            std::unique_lock<std::mutex> lock(init_mutex);
+            init_cv.wait(lock, [] { return is_initialized; });
+        }
 
-        // Create and connect the socket
-        tcp::socket socket(io_context);
-        boost::asio::connect(socket, endpoints);
+        // Wait for the counter to be less than max
+        {
+            std::unique_lock<std::mutex> lock(counter_mutex);
+            counter_cv.wait(lock, [] { return syncCounter->isLessThanMax(); });
+        }
 
-        // Convert task to a string (JSON format)
+        // Increment the counter
+        {
+            std::lock_guard<std::mutex> lock(counter_mutex);
+            syncCounter->increment(); 
+        }
+        counter_cv.notify_all();
+
+        // Prepare task
         std::string taskString = task.dump() + "\n";
 
-        // Send the task string to the server
-        boost::asio::write(socket, boost::asio::buffer(taskString));
+        // Send the task using the global socket
+        boost::asio::post(global_socket->get_executor(), [socket = global_socket.get(), taskString]() {
+            try {
+                boost::asio::write(*socket, boost::asio::buffer(taskString));
+            } catch (const std::exception& e) {
+                std::cerr << "Error writing to socket: " << e.what() << std::endl;
+            }
+        });
 
         ResponseData* responseData = new ResponseData();
-
         responseData->status = ResultStatus::OK;
 
-        // Return the response object with the acknowledgment status
         return responseData;
-
     } catch (std::exception& e) {
-        std::cerr << "Exception: " << e.what() << "\n";
+        std::cerr << "SubmitTaskAndWaitForResponse Exception: " << e.what() << "\n";
         ResponseData* responseData = new ResponseData();
-
         responseData->status = ResultStatus::ERROR;
         return responseData;
     }
