@@ -178,7 +178,6 @@ int RocksdbDB::ref_cnt_ = 0;
 std::mutex RocksdbDB::mu_;
 std::string db_path;
 
-std::unique_ptr<tcp::socket> global_socket;
 std::shared_ptr<SynchronizedCounter> syncCounter = nullptr;
 bool is_initialized(false);
 std::mutex init_mutex;
@@ -186,9 +185,15 @@ std::mutex counter_mutex;
 std::condition_variable counter_cv;
 std::condition_variable init_cv;
 
+boost::asio::io_context response_context_ = boost::asio::io_context();
+boost::asio::io_context io_context_ = boost::asio::io_context();
+std::unique_ptr<boost::asio::ip::tcp::acceptor> acceptor_;
+std::thread receive_thread_;
+std::atomic<bool> is_running_{false};
+
 void ReceiveThread(boost::asio::io_context& io_context, tcp::acceptor& acceptor) {
     try {
-        while (true) {
+        while (is_running_) {
             tcp::socket receive_socket(io_context);
             acceptor.accept(receive_socket);
 
@@ -222,11 +227,12 @@ void ReceiveThread(boost::asio::io_context& io_context, tcp::acceptor& acceptor)
                 }
             }
         }
-    } catch (std::exception& e) {
-        std::cerr << "ReceiveThread Exception: " << e.what() << std::endl;
+    } catch (const std::exception& e) {
+        if (is_running_) { // Only log if it's not a normal shutdown
+            std::cerr << "ReceiveThread Exception: " << e.what() << std::endl;
+        }
     }
 }
-
 
 void RocksdbDB::Init() {
 // merge operator disabled by default due to link error
@@ -332,26 +338,26 @@ void RocksdbDB::Init() {
   }
   delete db_;
 
-  boost::asio::io_context io_context;
-  tcp::resolver resolver(io_context);
+  tcp::resolver resolver(io_context_);
   auto endpoints = resolver.resolve("127.0.0.1", "12345");
-  global_socket = std::make_unique<tcp::socket>(io_context);
-  boost::asio::connect(*global_socket, endpoints);
   // Start detached thread for receiving responses
-  boost::asio::io_context response_context;
-  tcp::acceptor acceptor(response_context, tcp::endpoint(tcp::v4(), 0));
-  int response_port = acceptor.local_endpoint().port();
-  std::thread receive_thread([&response_context, &acceptor]() {
-      ReceiveThread(response_context, acceptor);
-  });
-  receive_thread.detach();
+  acceptor_ = std::make_unique<tcp::acceptor>(response_context_, tcp::endpoint(tcp::v4(), 0));
+  int response_port = acceptor_->local_endpoint().port();
+  is_running_ = true;
+  // Start the receive thread
+  receive_thread_ = std::thread([this]() {
+    ReceiveThread(response_context_, *acceptor_);
+    });
   // Send "start" message to the server
   json start_message = {
       {"operation", "start"},
       {"database", db_path},
       {"port", response_port}
   };
+  std::shared_ptr<tcp::socket> global_socket = std::make_shared<tcp::socket>(io_context_);
+
   std::string start_message_str = start_message.dump() + "\n";
+  global_socket->connect(*endpoints);
   boost::asio::write(*global_socket, boost::asio::buffer(start_message_str));
 }
 
@@ -563,7 +569,7 @@ ResponseData* SubmitTaskAndWaitForResponse(const std::string& requesterId, const
             std::unique_lock<std::mutex> lock(counter_mutex);
             counter_cv.wait(lock, [] { return syncCounter->isLessThanMax(); });
         }
-
+        
         // Increment the counter
         {
             std::lock_guard<std::mutex> lock(counter_mutex);
@@ -575,13 +581,15 @@ ResponseData* SubmitTaskAndWaitForResponse(const std::string& requesterId, const
         std::string taskString = task.dump() + "\n";
 
         // Send the task using the global socket
-        boost::asio::post(global_socket->get_executor(), [socket = global_socket.get(), taskString]() {
-            try {
-                boost::asio::write(*socket, boost::asio::buffer(taskString));
-            } catch (const std::exception& e) {
-                std::cerr << "Error writing to socket: " << e.what() << std::endl;
-            }
-        });
+        try {
+          //Make new socket
+          std::shared_ptr<tcp::socket> global_socket = std::make_shared<tcp::socket>(io_context_);
+          tcp::resolver resolver(io_context_);
+          global_socket->connect(tcp::endpoint(tcp::v4(), 12345));
+          boost::asio::write(*global_socket, boost::asio::buffer(taskString));
+        } catch (const std::exception& e) {
+            std::cerr << "Error writing to socket: " << e.what() << std::endl;
+        }
 
         ResponseData* responseData = new ResponseData();
         responseData->status = ResultStatus::OK;
@@ -597,6 +605,11 @@ ResponseData* SubmitTaskAndWaitForResponse(const std::string& requesterId, const
 
 void RocksdbDB::Cleanup() { 
   std::string requesterId = getCurrentThreadIdAsString(); // Get the current thread ID as the requester ID
+
+  //Sleep for 
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+
+  is_running_ = false;  // Set the flag to stop the receive thread
 
   json endTask;
   endTask["requesterId"] = requesterId;
