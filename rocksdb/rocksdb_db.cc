@@ -195,6 +195,8 @@ void ReceiveThread(boost::asio::io_context& io_context, tcp::acceptor& acceptor)
     try {
         while (is_running_) {
             tcp::socket receive_socket(io_context);
+            
+            // This allows us to exit the loop if the io_context is stopped.
             acceptor.accept(receive_socket);
 
             // Read incoming data
@@ -224,6 +226,9 @@ void ReceiveThread(boost::asio::io_context& io_context, tcp::acceptor& acceptor)
                         syncCounter->decrement(); 
                     }
                     counter_cv.notify_all();
+                } else if (command == "exit") {
+                    is_running_ = false;
+                    break;
                 }
             }
         }
@@ -233,6 +238,7 @@ void ReceiveThread(boost::asio::io_context& io_context, tcp::acceptor& acceptor)
         }
     }
 }
+
 
 void RocksdbDB::Init() {
 // merge operator disabled by default due to link error
@@ -609,8 +615,6 @@ void RocksdbDB::Cleanup() {
   //Sleep for 
   std::this_thread::sleep_for(std::chrono::seconds(1));
 
-  is_running_ = false;  // Set the flag to stop the receive thread
-
   json endTask;
   endTask["requesterId"] = requesterId;
   endTask["operation"] = "end";
@@ -625,6 +629,8 @@ void RocksdbDB::Cleanup() {
   }
 
   delete endResponse;  // Clean up the response object
+
+  receive_thread_.join();  // Wait for the receive thread to finish
 
   const std::lock_guard<std::mutex> lock(mu_);
   if (--ref_cnt_) {
